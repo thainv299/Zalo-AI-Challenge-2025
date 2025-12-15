@@ -1,0 +1,46 @@
+public_test/videos
+train/videos
+models
+traffic_signs_vietnam
+runs
+dataset
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.Trashes
+Thumbs.db
+
+# Data and output directories
+Frames/
+output/
+public_test
+train
+download_videos.py
+
+cached_vlm/

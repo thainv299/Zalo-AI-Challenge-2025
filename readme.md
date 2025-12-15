@@ -106,7 +106,7 @@ The system runs stably and meets the required processing speed constraints.
 A complete end-to-end pipeline has been implemented, from object detection to reasoning and answer generation.
 The current performance reaches approximately 0.5 on the public test set, serving as an initial baseline.
 The performance can be further improved through fine-tuning and data optimization
-![System Output Example](asset\demo.png)
+![System Output Example](asset/demo.png)
 ## TrafficBuddy Dataset Structure
 ```
 ├── public_test/

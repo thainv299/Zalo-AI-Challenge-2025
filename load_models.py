@@ -56,12 +56,8 @@ def get_quantization_config():
     )
 
 def load_model_yolo(model_path):
-    # Thêm task='detect' để tránh cảnh báo từ Ultralytics
-    model = YOLO(model_path, task='detect')
-    
-    # CHỈ gọi .eval() nếu là file PyTorch (.pt)
-    if model_path.endswith('.pt'):
-        model.model.eval()
+    model = YOLO(model_path)
+    model.model.eval()
     return model
 
 
@@ -115,17 +111,10 @@ def load_models(progress_callback=None):
     if progress_callback:
         progress_callback(5, "Khởi tạo...")
 
-   # YOLO (10–25%)
+    # YOLO (10–25%)
     if progress_callback:
-        progress_callback(10, "Đang kiểm tra và tải YOLO...")
-
-    # Logic: Nếu có file .engine thì ưu tiên dùng, không thì dùng .pt
-    current_path = YOLO_MODEL_PATH
-    engine_path = YOLO_MODEL_PATH.replace('.pt', '.engine')
-    if os.path.exists(engine_path):
-        current_path = engine_path
-    models['yolo'] = load_model_yolo(current_path)
-    
+        progress_callback(10, "Đang tải YOLO...")
+    models['yolo'] = load_model_yolo(YOLO_MODEL_PATH)
     if progress_callback:
         progress_callback(25, "YOLO đã tải xong")
 

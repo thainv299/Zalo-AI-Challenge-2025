@@ -92,20 +92,29 @@ def process_yolo_tracker(frames_queue, model: YOLO, tracker: BestFrameTracker, b
     return frames, video_info
 
 def _run_batch_inference(batch_frames, model, tracker):
-    """Hàm chạy thực thi batch trên GPU Blackwell"""
     with torch.no_grad():
-        # AMP (Automatic Mixed Precision) giúp tăng tốc độ tính toán và giảm sử dụng VRAM
+        # Vẫn dùng autocast để tối ưu nhân Tensor trên RTX 5060 Ti
         with torch.amp.autocast('cuda'):
-            results = model.track(batch_frames, tracker="bytetrack.yaml", verbose=False, persist=True)
+            results = model.track(
+                batch_frames, 
+                tracker="bytetrack.yaml", 
+                verbose=False, 
+                persist=True
+            )
             
         for i, res in enumerate(results):
             if not res.boxes or res.boxes.id is None:
                 continue
             for box in res.boxes:
                 if box.id is None: continue
-                tracker.update_track(batch_frames[i], int(box.id), 
-                                     box.xyxy[0].cpu().numpy().astype(int), 
-                                     float(box.conf), res.names[int(box.cls)])
+                # Trích xuất track_id
+                tracker.update_track(
+                    batch_frames[i], 
+                    int(box.id), 
+                    box.xyxy[0].cpu().numpy().astype(int), 
+                    float(box.conf), 
+                    res.names[int(box.cls)]
+                )
 
 def process_single_question_logic(question_data, models, tracker: BestFrameTracker, enable_thinking: bool = False):
     """

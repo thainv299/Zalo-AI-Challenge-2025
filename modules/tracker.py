@@ -16,8 +16,8 @@ class BestFrameTracker:
         
         sharpness = self.calculate_sharpness(object_region)
         
-        # Áp dụng Lọc Cứng: Loại bỏ nếu Confidence quá thấp HOẶC Sharpness quá mờ (Tối ưu cho VLM/OCR)
-        if confidence < 0.4 or sharpness < 100.0:
+        # Áp dụng Lọc Cứng: Loại bỏ nếu Confidence quá thấp
+        if confidence < 0.4:
             return False
             
         quality_score = self.calculate_quality_score(confidence, sharpness, max_sharpness=5000)

@@ -607,13 +607,21 @@ class TrafficQAGUI:
         ans_key = result['llm_output']
         q_data = ALL_QUESTIONS[self.selected_idx]
 
+        # Lấy đầy đủ văn bản cho đáp án dự đoán
         pred_answer = map_answer_text(ans_key, q_data['choices'])
-        true_answer = q_data.get("answer")
         
-        if true_answer:
-            is_correct = pred_answer.strip() == true_answer.strip()
-            # Sử dụng định dạng có thụt lề rõ ràng
-            display_text = f"Dự đoán: {pred_answer}\nThực tế:  {true_answer}"
+        # Lấy đáp án thực tế từ JSON
+        raw_true_answer = q_data.get("answer", "")
+        
+        # Nếu đáp án thực tế chỉ là "A", "B"... thì map nó sang văn bản đầy đủ
+        # Nếu nó đã là văn bản đầy đủ "A. Nội dung...", hàm map sẽ xử lý chuẩn hóa
+        true_answer_full = map_answer_text(raw_true_answer, q_data['choices'])
+        
+        if raw_true_answer:
+            # So sánh dựa trên ký tự đầu (A, B, C...) để chính xác tuyệt đối
+            is_correct = ans_key.strip().upper() == raw_true_answer.strip().upper()
+            
+            display_text = f"Dự đoán: {pred_answer}\nThực tế:  {true_answer_full}"
             self.lbl_result.config(
                 text=display_text,
                 fg="#2E7D32" if is_correct else "#C62828"

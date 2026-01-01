@@ -1,7 +1,18 @@
+import os
+import torch
+# Tối ưu cho RTX 5060 Ti (sm_120)
+os.environ['TORCH_CUDA_ARCH_LIST'] = "12.0"
+os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
+# Tránh phân mảnh VRAM và tăng tốc độ cấp phát
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "expandable_segments:True"
+if torch.cuda.is_available():
+    # TF32 giúp tăng tốc độ tính toán trên RTX 30/40/50 mà không mất nhiều độ chính xác
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Cho phép cuDNN tự tìm thuật toán tối ưu nhất cho phần cứng hiện tại
+    torch.backends.cudnn.benchmark = True
 import time
 import json
-import torch
-import os
 import threading
 import cv2
 from PIL import Image, ImageTk
@@ -16,7 +27,6 @@ from modules.llm import llm_choise_answer
 from utils.cached_helper import get_vlm_cache, save_vlm_cache
 from ultralytics import YOLO
 from modules.tracker import BestFrameTracker
-
 # --- CONSTANTS ---
 YOLO_JSON_DIR = 'yolo_json'
 
@@ -43,54 +53,59 @@ def save_yolo_json(question_id, yolo_data_json):
     except Exception as e:
         print(f"Lỗi khi lưu YOLO JSON: {e}")
 
-def process_yolo_tracker(frames_queue, model: YOLO, tracker: BestFrameTracker):
-    """Chạy YOLO Tracking"""
+def process_yolo_tracker(frames_queue, model: YOLO, tracker: BestFrameTracker, batch_size=12):
+    """
+    Tối ưu cho RTX 5060 Ti: Sử dụng Batch Inference + Half Precision (FP16)
+    """
     tracker.__init__()
+    frames_buffer = []
     
+    # Đưa model lên GPU và chuyển sang chế độ Half (FP16) để tăng tốc 2-3 lần
+    model.to('cuda').half() 
+
     while True:
         frame = frames_queue.get()
         if frame is None:
+            if frames_buffer:
+                _run_batch_inference(frames_buffer, model, tracker)
             break
             
-        try:
-            with torch.no_grad():
-                results = model.track(frame, tracker="bytetrack.yaml", verbose=False)
-                
-            if not results or len(results) == 0:
-                continue
-        except Exception:
-            continue
+        frames_buffer.append(frame)
+        
+        # Gom đủ batch_size rồi mới đẩy vào GPU một lần
+        if len(frames_buffer) >= batch_size:
+            _run_batch_inference(frames_buffer, model, tracker)
+            frames_buffer = []
 
-        for box in results[0].boxes:
-            if box.id is None: 
-                continue
-    
-            bbox = box.xyxy[0].cpu().numpy().astype(int)
-            track_id = int(box.id)
-            conf = float(box.conf)
-            cls_id = int(box.cls)
-            cls_name = results[0].names[cls_id]
-
-            tracker.update_track(frame, track_id, bbox, conf, cls_name)
-            
-    frames = [data.frame for data in tracker.best_frames.values()]
-    
+    # Trích xuất dữ liệu sau khi track xong
     yolo_data_list = []
     for track_id, frame_data in tracker.best_frames.items():
         yolo_data_list.append({
             "track_id": track_id,
             "object_type": frame_data.box_info.class_name,
             "bbox": frame_data.box_info.bbox.tolist(),
-            "confidence": round(frame_data.box_info.confidence, 3),
-            "sharpness": round(frame_data.box_info.sharpness, 2)
+            "confidence": round(frame_data.box_info.confidence, 3)
         })
 
-    if yolo_data_list:
-        video_info = json.dumps(yolo_data_list, ensure_ascii=False, indent=2)
-    else:
-        video_info = "[]"
-        
+    video_info = json.dumps(yolo_data_list, ensure_ascii=False, indent=2)
+    frames = [data.frame for data in tracker.best_frames.values()]
     return frames, video_info
+
+def _run_batch_inference(batch_frames, model, tracker):
+    """Hàm chạy thực thi batch trên GPU Blackwell"""
+    with torch.no_grad():
+        # AMP (Automatic Mixed Precision) giúp tăng tốc độ tính toán và giảm sử dụng VRAM
+        with torch.amp.autocast('cuda'):
+            results = model.track(batch_frames, tracker="bytetrack.yaml", verbose=False, persist=True)
+            
+        for i, res in enumerate(results):
+            if not res.boxes or res.boxes.id is None:
+                continue
+            for box in res.boxes:
+                if box.id is None: continue
+                tracker.update_track(batch_frames[i], int(box.id), 
+                                     box.xyxy[0].cpu().numpy().astype(int), 
+                                     float(box.conf), res.names[int(box.cls)])
 
 def process_single_question_logic(question_data, models, tracker: BestFrameTracker, enable_thinking: bool = False):
     """
@@ -115,6 +130,7 @@ def process_single_question_logic(question_data, models, tracker: BestFrameTrack
         }
 
     try:
+        torch.cuda.empty_cache()
         # 1. Check Cache VLM
         vlm_description, video_info = get_vlm_cache(video_path)
         
@@ -123,7 +139,7 @@ def process_single_question_logic(question_data, models, tracker: BestFrameTrack
             print(f"▶️ Xử lý video: {os.path.basename(video_path)}")
             
             frames_queue = extract_frames_to_queue(video_path)
-            frames, video_info = process_yolo_tracker(frames_queue, models['yolo'], tracker)
+            frames, video_info = process_yolo_tracker(frames_queue, models['yolo'], tracker, batch_size=12)
             save_yolo_json(question_id, video_info)
 
             choices_str = "\n".join(question_data['choices'])
@@ -266,8 +282,11 @@ class TrafficQAGUI:
         llm_frame.pack(fill='x', pady=5)
         
         self.lbl_result = tk.Label(llm_frame, text="Đáp án: ---", 
-                                   font=('Arial', 24, 'bold'), fg="blue")
-        self.lbl_result.pack(side='left', padx=20)
+                           font=('Arial', 18, 'bold'), # Giảm nhẹ size nếu text dài
+                           fg="blue",
+                           anchor='w',       # Căn nội dung trong Label sang trái
+                           justify='left')   # Căn lề trái nếu text có nhiều dòng
+        self.lbl_result.pack(side='left', padx=20, pady=10, fill='x', expand=True) 
         
         self.lbl_time = tk.Label(llm_frame, text="Thời gian: ---", 
                                 font=('Arial', 10))
@@ -280,61 +299,62 @@ class TrafficQAGUI:
 
         self.start_loading_models()
     def start_yolo_video(self, video_path):
-        """Mở cửa sổ mới và hiển thị video với YOLO detect"""
+        """Chỉ mở thread chạy OpenCV, không tạo Toplevel của Tkinter nữa"""
         if MODELS is None:
             messagebox.showwarning("Chưa sẵn sàng", "Mô hình chưa tải xong.")
             return
 
-        # Tạo cửa sổ mới
-        self.video_window = tk.Toplevel(self.master)
-        self.video_window.title(f"Video YOLO - {os.path.basename(video_path)}")
-        self.video_window.geometry("1920x1080")
-        self.video_window.resizable(False, False)
-
-        # Label để hiển thị frame
-        self.video_label = tk.Label(self.video_window)
-        self.video_label.pack()
-
-        # Start thread chạy video
+        # Start thread chạy video OpenCV trực tiếp
         thread = threading.Thread(target=self.thread_run_yolo_video, args=(video_path,))
         thread.daemon = True
         thread.start()
 
     def thread_run_yolo_video(self, video_path):
-        """Thread chạy video frame-by-frame và vẽ YOLO detect, chỉ hiển thị frame có detect"""
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        delay = int(1000 / fps) if fps > 0 else 33
+
+        # Đặt tên cửa sổ và cho phép thay đổi kích thước
+        window_name = f"YOLO Viewer - {os.path.basename(video_path)}"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 960, 540) # Kích thước mặc định vừa mắt
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # YOLO detect
+            # Resize để xử lý nhanh hơn trên RTX 5060 Ti
+            frame_resized = cv2.resize(frame, (960, 540))
+
             try:
-                results = MODELS['yolo'](frame)[0]  # detect frame
-                if len(results.boxes) == 0:
-                    continue  # Bỏ qua frame không detect được object
-                frame = results.plot()  # Vẽ bounding box lên frame
-            except Exception as e:
-                print("Lỗi YOLO detect:", e)
-                continue
+                # Chạy inference với TensorRT cực nhanh
+                with torch.no_grad():
+                    # model.predict sẽ tự nhận diện .engine hoặc .pt
+                    results = MODELS['yolo'].predict(
+                        frame_resized,
+                        conf=0.4,
+                        verbose=False
+                    )[0]
 
-            # Resize để vừa window
-            frame = cv2.resize(frame, (1920, 1080))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame)
-            imgtk = ImageTk.PhotoImage(image=img)
+                if results.boxes is not None:
+                    frame_resized = results.plot()
+            except Exception:
+                pass
 
-            # Cập nhật label
-            self.video_label.imgtk = imgtk
-            self.video_label.config(image=imgtk)
+            cv2.imshow(window_name, frame_resized)
 
-            # Delay theo FPS
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            delay = int(1000 / fps) if fps > 0 else 33
-            self.video_label.after(delay)
+            # Nhấn 'q' hoặc đóng cửa sổ bằng dấu X để thoát
+            if cv2.waitKey(delay) & 0xFF == ord('q'):
+                break
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
 
         cap.release()
-
+        cv2.destroyWindow(window_name)
 
     def start_loading_models(self):
         """Hiển thị cửa sổ loading với progress bar"""
@@ -417,7 +437,10 @@ class TrafficQAGUI:
             self.master.after(0, lambda: self.on_models_loaded(True))
             
         except Exception as e:
-            self.master.after(0, lambda: self.on_models_loaded(False, str(e)))
+            import traceback
+            traceback.print_exc()  # IN RA LỖI THẬT
+            err_msg = str(e) if str(e) else "Lỗi không xác định khi load mô hình"
+            self.master.after(0, lambda: self.on_models_loaded(False, err_msg))
 
     def on_models_loaded(self, success, error_msg=""):
         """Đóng loading window và thông báo kết quả"""
@@ -477,35 +500,43 @@ class TrafficQAGUI:
         self.selected_idx = index
         q_data = ALL_QUESTIONS[index]
         
-        display_text = f"ID: {q_data['id']}\n"
-        display_text += f"Video: {q_data['video_path']}\n"
-        display_text += f"-"*50 + "\n"
-        display_text += f"CÂU HỎI: {q_data['question']}\n\n"
-        display_text += "LỰA CHỌN:\n"
-        if isinstance(q_data['choices'], list):
-            for c in q_data['choices']:
-                display_text += f"{c}\n"
-        else:
-            display_text += str(q_data['choices'])
-            
         self.txt_question.config(state='normal')
         self.txt_question.delete('1.0', tk.END)
-        self.txt_question.insert('1.0', display_text)
-        self.txt_question.config(state='disabled')
-        
-        # Reset results
-        self.txt_vlm.config(state='normal')
-        self.txt_vlm.delete('1.0', tk.END)
-        self.txt_vlm.config(state='disabled')
-        
-        self.txt_thinking.config(state='normal')
-        self.txt_thinking.delete('1.0', tk.END)
-        self.txt_thinking.config(state='disabled')
-        self.thinking_frame.pack_forget()  # Hide thinking frame
-        
-        self.lbl_result.config(text="Đáp án: ---", fg="blue")
-        self.lbl_time.config(text="Thời gian: ---")
 
+        self.txt_question.insert(tk.END, f"ID: {q_data['id']}\n")
+        self.txt_question.insert(tk.END, f"Video: {q_data['video_path']}\n")
+        self.txt_question.insert(tk.END, "-"*50 + "\n")
+        self.txt_question.insert(tk.END, f"CÂU HỎI: {q_data['question']}\n\n")
+        self.txt_question.insert(tk.END, "LỰA CHỌN:\n")
+
+        true_answer = q_data.get("answer")
+        if true_answer:
+            true_answer = true_answer.strip().upper()
+            if '.' in true_answer:
+                true_answer = true_answer.split('.')[0]
+
+        # Tag cho đáp án đúng
+        self.txt_question.tag_configure(
+            "correct_answer",
+            foreground="red",
+            font=('Consolas', 10, 'bold')
+        )
+
+        for choice in q_data['choices']:
+            start = self.txt_question.index(tk.END)
+
+            key, val = choice.split('.', 1)
+            key = key.strip().upper()
+            text = f"{key}: {val.strip()}\n"
+
+            self.txt_question.insert(tk.END, text)
+
+            if true_answer and key == true_answer:
+                end = self.txt_question.index(tk.END)
+                self.txt_question.tag_add("correct_answer", start, end)
+        self.txt_question.config(state='disabled')
+
+        
     def start_processing(self):
         if self.selected_idx is None:
             messagebox.showwarning("Chưa chọn", "Vui lòng chọn câu hỏi.")
@@ -573,12 +604,44 @@ class TrafficQAGUI:
             self.thinking_frame.pack_forget()
         
         # LLM Result
-        ans = result['llm_output']
-        self.lbl_result.config(text=f"Đáp án: {ans}", fg="red")
+        ans_key = result['llm_output']
+        q_data = ALL_QUESTIONS[self.selected_idx]
+
+        pred_answer = map_answer_text(ans_key, q_data['choices'])
+        true_answer = q_data.get("answer")
+        
+        if true_answer:
+            is_correct = pred_answer.strip() == true_answer.strip()
+            # Sử dụng định dạng có thụt lề rõ ràng
+            display_text = f"Dự đoán: {pred_answer}\nThực tế:  {true_answer}"
+            self.lbl_result.config(
+                text=display_text,
+                fg="#2E7D32" if is_correct else "#C62828"
+            )
+        else:
+            self.lbl_result.config(
+                text=f"Dự đoán: {pred_answer}",
+                fg="blue"
+            )
         self.lbl_time.config(text=f"Thời gian: {elapsed_time:.2f}s")
         
         think_mode = "ON" if self.enable_thinking.get() else "OFF"
         self.statusbar.config(text=f"Hoàn tất. Thời gian: {elapsed_time:.2f}s | Thinking: {think_mode}")
+def map_answer_text(answer_key, choices):
+    """
+    answer_key: 'A', 'B', 'C', ...
+    choices: ['A. ...', 'B. ...']
+    """
+    if not answer_key:
+        return answer_key
+
+    answer_key = answer_key.strip().upper()
+
+    for c in choices:
+        if c.strip().startswith(answer_key + "."):
+            return c.strip()
+
+    return answer_key
 
 # ==========================================
 # MAIN

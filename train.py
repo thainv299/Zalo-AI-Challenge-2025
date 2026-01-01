@@ -7,7 +7,7 @@ if __name__ == "__main__":
     DATA_PATH = r"dataset\data.yaml"
 
     # Khởi tạo mô hình (kiểm tra lại tên file: 'yolo12s.pt' hoặc 'yolov12s.pt')
-    model = YOLO("yolo12s.pt")  
+    model = YOLO("yolo12s.pt")  # Tải mô hình yolo12s trên trang chủ của Ultralytics
 
     # Điều chỉnh tham số training
     results = model.train(

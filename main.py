@@ -55,30 +55,50 @@ def save_yolo_json(question_id, yolo_data_json):
 
 def process_yolo_tracker(frames_queue, model: YOLO, tracker: BestFrameTracker, batch_size=12):
     """
-    Tối ưu cho RTX 5060 Ti: Sử dụng Batch Inference + Half Precision (FP16)
+    Sửa lỗi No Frames: Thêm cơ chế đợi dữ liệu vào Queue
     """
-    tracker.__init__()
+    # Xóa sạch dữ liệu cũ trong tracker trước khi bắt đầu câu hỏi mới
+    tracker.best_frames.clear()
     frames_buffer = []
     
-    # Đưa model lên GPU và chuyển sang chế độ Half (FP16) để tăng tốc 2-3 lần
-    model.to('cuda').half() 
+    # Ép kiểu Half để tối ưu RTX 5060 Ti
+    model.to('cuda').half()
+
+    # Cơ chế đợi: Nếu Queue rỗng, đợi tối đa 5 giây để frame đầu tiên xuất hiện
+    wait_time = 0
+    while frames_queue.empty() and wait_time < 5:
+        time.sleep(0.1)
+        wait_time += 0.1
 
     while True:
-        frame = frames_queue.get()
-        if frame is None:
+        try:
+            # Sử dụng timeout để tránh kẹt nếu thread trích xuất frame gặp sự cố
+            frame = frames_queue.get(timeout=2)
+            
+            if frame is None: # Tín hiệu kết thúc video
+                if frames_buffer:
+                    _run_batch_inference(frames_buffer, model, tracker)
+                break
+                
+            frames_buffer.append(frame)
+            
+            if len(frames_buffer) >= batch_size:
+                _run_batch_inference(frames_buffer, model, tracker)
+                frames_buffer = []
+        except: # Hết frame hoặc queue bị timeout
             if frames_buffer:
                 _run_batch_inference(frames_buffer, model, tracker)
             break
-            
-        frames_buffer.append(frame)
-        
-        # Gom đủ batch_size rồi mới đẩy vào GPU một lần
-        if len(frames_buffer) >= batch_size:
-            _run_batch_inference(frames_buffer, model, tracker)
-            frames_buffer = []
 
-    # Trích xuất dữ liệu sau khi track xong
+    # Trích xuất dữ liệu sau khi xử lý xong
     yolo_data_list = []
+    frames = []
+    
+    # Kiểm tra xem có bắt được đối tượng nào không
+    if not tracker.best_frames:
+        print("⚠️ YOLO không tìm thấy đối tượng nào trong các frame đã trích xuất.")
+        return [], "[]"
+
     for track_id, frame_data in tracker.best_frames.items():
         yolo_data_list.append({
             "track_id": track_id,
@@ -86,9 +106,9 @@ def process_yolo_tracker(frames_queue, model: YOLO, tracker: BestFrameTracker, b
             "bbox": frame_data.box_info.bbox.tolist(),
             "confidence": round(frame_data.box_info.confidence, 3)
         })
+        frames.append(frame_data.frame)
 
     video_info = json.dumps(yolo_data_list, ensure_ascii=False, indent=2)
-    frames = [data.frame for data in tracker.best_frames.values()]
     return frames, video_info
 
 def _run_batch_inference(batch_frames, model, tracker):
@@ -584,14 +604,12 @@ class TrafficQAGUI:
             self.statusbar.config(text="Xảy ra lỗi khi xử lý.")
             messagebox.showerror("Lỗi Xử lý", result['error'])
             return
-        # Mở video với YOLO detect
+
+        # HIỂN THỊ VIDEO TẠI ĐÂY (Sau khi chạy xong LLM)
         q_data = ALL_QUESTIONS[self.selected_idx]
         video_rel_path = q_data['video_path']
-        if CURRENT_VIDEO_FOLDER:
-            base_dir = os.path.dirname(CURRENT_VIDEO_FOLDER)
-            video_path = os.path.join(base_dir, video_rel_path)
-        else:
-            video_path = video_rel_path
+        base_dir = os.path.dirname(CURRENT_VIDEO_FOLDER) if CURRENT_VIDEO_FOLDER else ""
+        video_path = os.path.join(base_dir, video_rel_path)
 
         if os.path.exists(video_path):
             self.start_yolo_video(video_path)
